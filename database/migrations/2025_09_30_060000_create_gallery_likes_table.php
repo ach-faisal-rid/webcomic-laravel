@@ -11,12 +11,13 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::create('galleries', function (Blueprint $table) {
+        Schema::create('gallery_likes', function (Blueprint $table) {
             $table->id();
-            $table->string('title')->nullable();
-            $table->string('source_url')->nullable(); // URL asli (Pinterest)
-            $table->string('image_path');             // lokasi file di storage
+            $table->foreignId('user_id')->constrained()->onDelete('cascade');
+            $table->foreignId('gallery_id')->constrained('galleries')->onDelete('cascade');
             $table->timestamps();
+
+            $table->unique(['user_id', 'gallery_id']);
         });
     }
 
@@ -25,6 +26,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('galleries');
+        Schema::dropIfExists('gallery_likes');
     }
 };

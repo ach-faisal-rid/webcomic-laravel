@@ -3,75 +3,165 @@
 namespace App\Http\Controllers;
 
 use App\Models\Gallery;
-use Illuminate\Support\Str;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
+use GuzzleHttp\Client;
 use Illuminate\Support\Facades\Storage;
-use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\Log;
-use Exception;
+use Illuminate\Support\Str;
+use Inertia\Inertia;
+use Illuminate\Support\Facades\Auth;
 
 class GalleryController extends Controller
 {
-    public function fetch(Request $request)
+    /**
+     * Tampilkan daftar gallery.
+     */
+    public function index()
     {
-        $request->validate([
-            'url' => 'required|url',
-            'title' => 'nullable|string|max:255',
+        $userId = Auth::id();
+        $galleries = Gallery::with('images')->get()->map(function ($g) use ($userId) {
+            $images = $g->images->map(function ($img) {
+                return [
+                    'id' => $img->id,
+                    'src' => $img->image_path ? Storage::url($img->image_path) : null,
+                ];
+            })->toArray();
+            // legacy: jika tidak ada images relasi, ambil dari kolom image_path
+            if (empty($images) && $g->image_path) {
+                $images[] = [
+                    'id' => null,
+                    'src' => Storage::url($g->image_path),
+                ];
+            }
+            return [
+                'id' => $g->id,
+                'title' => $g->title,
+                'source_url' => $g->source_url,
+                'images' => $images,
+                'like_count' => $g->like_count,
+                'share_count' => $g->share_count,
+                'liked' => $userId ? (bool) $g->likes()->where('user_id', $userId)->exists() : false,
+                'created_at' => $g->created_at,
+                'updated_at' => $g->updated_at,
+            ];
+        });
+        return Inertia::render('Gallery/Index', [
+            'galleries' => $galleries
+        ]);
+    }
+
+    /**
+     * Form tambah gallery.
+     */
+    public function create()
+    {
+        return Inertia::render('Gallery/Create');
+    }
+
+    /**
+     * Simpan data gallery baru.
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'srcs'   => 'required|array|min:1', // array of image URLs
+            'srcs.*' => 'required|url',
         ]);
 
-        try {
-            $response = Http::withHeaders([
-                'User-Agent' => 'webcomic-laravel/1.0',
-            ])->get($request->url);
-        } catch (Exception $e) {
-            Log::error('Failed to fetch remote image', ['url' => $request->url, 'error' => $e->getMessage()]);
-            return back()->withErrors(['url' => 'Gagal mengunduh gambar: koneksi gagal']);
-        }
+        $gallery = Gallery::create([
+            'title' => $validated['title'],
+            'source_url' => $validated['srcs'][0], // simpan url pertama sebagai sumber utama
+        ]);
 
-        if (! $response->successful()) {
-            return back()->withErrors(['url' => 'Gagal mengunduh gambar: HTTP ' . $response->status()]);
-        }
+        $client = new Client(['timeout' => 10]);
 
-        $contentType = $response->header('Content-Type');
+        foreach ($validated['srcs'] as $src) {
+            try {
+                $res = $client->get($src, ['http_errors' => false]);
+                $status = $res->getStatusCode();
+                if ($status !== 200) {
+                    continue; // skip gagal
+                }
 
-        if (! $contentType || ! Str::startsWith($contentType, 'image/')) {
-            return back()->withErrors(['url' => 'URL tidak mengarah ke gambar (Content-Type: ' . ($contentType ?? 'unknown') . ')']);
-        }
+                $contentType = $res->getHeaderLine('Content-Type');
+                if (!str_starts_with($contentType, 'image/')) {
+                    continue; // skip non-image
+                }
 
-        // Try to determine extension from content type or URL
-        $extension = null;
-        if (preg_match('#image/(\w+)#', $contentType, $m)) {
-            $extension = strtolower($m[1]);
-            // normalize jpeg -> jpg
-            if ($extension === 'jpeg') {
-                $extension = 'jpg';
+                $body = $res->getBody()->getContents();
+
+                $ext = null;
+                if ($contentType && strpos($contentType, '/') !== false) {
+                    $ext = explode('/', $contentType)[1];
+                    $ext = explode(';', $ext)[0];
+                }
+                if (!$ext) {
+                    $ext = pathinfo(parse_url($src, PHP_URL_PATH), PATHINFO_EXTENSION) ?: 'jpg';
+                }
+
+                $filename = 'galleries/' . Str::slug($validated['title']) . '-' . time() . '-' . uniqid() . '.' . $ext;
+                Storage::disk('public')->put($filename, $body);
+
+                $gallery->images()->create([
+                    'image_path' => $filename,
+                ]);
+            } catch (\Exception $e) {
+                continue;
             }
         }
 
-        if (! $extension) {
-            $extension = pathinfo(parse_url($request->url, PHP_URL_PATH) ?? '', PATHINFO_EXTENSION) ?: 'jpg';
+        return redirect()->route('gallery.index')
+            ->with('success', 'Gallery berhasil ditambahkan.');
+    }
+
+    /**
+     * Hapus gallery.
+     */
+    public function destroy(Gallery $gallery)
+    {
+        $gallery->delete();
+
+        return redirect()->route('gallery.index')
+        ->with('success', 'Gallery berhasil dihapus.');
+    }
+
+    // Like a gallery
+    public function like(Gallery $gallery)
+    {
+    $user = Auth::user();
+        if (!$user) {
+            return response()->json(['error' => 'Unauthenticated'], 401);
         }
 
-        $safeTitle = $request->filled('title') ? Str::slug($request->title) : null;
-        $filename = 'pinterest_' . time() . '_' . Str::random(6) . ($safeTitle ? '_' . $safeTitle : '') . '.' . $extension;
-        $path = 'comics/gallery/' . $filename;
-
-        // store to the public disk
-        try {
-            Storage::disk('public')->put($path, $response->body());
-        } catch (Exception $e) {
-            Log::error('Failed to store downloaded image', ['path' => $path, 'error' => $e->getMessage()]);
-            return back()->withErrors(['url' => 'Gagal menyimpan gambar ke storage']);
+        // attach if not already liked
+        if (! $gallery->likes()->where('user_id', $user->id)->exists()) {
+            $gallery->likes()->attach($user->id);
+            $gallery->increment('like_count');
         }
 
-        // simpan metadata ke database
-        Gallery::create([
-            'title' => $request->title,
-            'source_url' => $request->url,
-            'image_path' => $path,
-        ]);
+        return response()->json(['like_count' => $gallery->like_count]);
+    }
 
-        return back()->with('success', 'Gambar berhasil diunduh!');
+    // Unlike a gallery
+    public function unlike(Gallery $gallery)
+    {
+    $user = Auth::user();
+        if (!$user) {
+            return response()->json(['error' => 'Unauthenticated'], 401);
+        }
+
+        if ($gallery->likes()->where('user_id', $user->id)->exists()) {
+            $gallery->likes()->detach($user->id);
+            $gallery->decrement('like_count');
+        }
+
+        return response()->json(['like_count' => $gallery->like_count]);
+    }
+
+    // Share counter increment (stateless)
+    public function share(Gallery $gallery)
+    {
+        $gallery->increment('share_count');
+        return response()->json(['share_count' => $gallery->share_count]);
     }
 }
